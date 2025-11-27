@@ -17,9 +17,15 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.loader import CachedFolder
 
 from models.vae import AutoencoderKL
-from models import mar
-from engine_mar import train_one_epoch, evaluate
+from models import mar_order_token
+from engine_mar_order_token import train_one_epoch, evaluate
 import copy
+
+try:
+    import wandb  # type: ignore
+    _WANDB_AVAILABLE = True
+except Exception:
+    _WANDB_AVAILABLE = False
 
 
 def get_args_parser():
@@ -32,6 +38,9 @@ def get_args_parser():
     parser.add_argument('--model', default='mar_large', type=str, metavar='MODEL',
                         help='Name of model to train')
 
+    parser.add_argument('--pretrained_mar_path', default="pretrained_models/mar_large.pth", type=str,
+                        help='Path to the frozen MAR checkpoint')
+    
     # VAE parameters
     parser.add_argument('--img_size', default=256, type=int,
                         help='images input size')
@@ -58,6 +67,10 @@ def get_args_parser():
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--eval_bsz', type=int, default=64, help='generation batch size')
 
+    parser.add_argument('--order_mode', default="random", type=str) # gradient
+    parser.add_argument('--train_only_head', action='store_true',
+                        help='freeze mar networks')
+    
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.02,
                         help='weight decay (default: 0.02)')
@@ -130,6 +143,9 @@ def get_args_parser():
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
 
+    parser.add_argument('--num_images_eval', default=5000, type=int,
+                    help='number of images to generate during online eval')
+    
     return parser
 
 
@@ -189,7 +205,7 @@ def main(args):
     for param in vae.parameters():
         param.requires_grad = False
 
-    model = mar.__dict__[args.model](
+    model = mar_order_token.__dict__[args.model](
         img_size=args.img_size,
         vae_stride=args.vae_stride,
         patch_size=args.patch_size,
@@ -206,11 +222,28 @@ def main(args):
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
     )
+    
+    # --------------------------------------------------------------------------
+    # CRITICAL: Load Pretrained Weights and Freeze Body
+    # --------------------------------------------------------------------------
+    print(f"Loading pretrained MAR model from {args.pretrained_mar_path}")
+    checkpoint = torch.load(args.pretrained_mar_path, map_location='cpu')
+    model_key = 'model' if 'model' in checkpoint else 'model_ema' 
+    # Note: pretrained model won't have 'order_head' keys, so strict=False
+    missing, unexpected = model.load_state_dict(checkpoint[model_key], strict=False)
+    print(f"Missing keys: {missing}") # Should include order_head parameters
+    print(f"Unexpected keys: {unexpected}")
 
-    print("Model = %s" % str(model))
-    # following timm: set wd as 0 for bias and norm layers
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Number of trainable parameters: {}M".format(n_params / 1e6))
+    print("Freezing MAR body parameters...")
+    for name, param in model.named_parameters():
+        if "order_head" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Number of trainable parameters (OrderHead Only): {}M".format(n_trainable / 1e6))
+    # --------------------------------------------------------------------------
 
     model.to(device)
     model_without_ddp = model
@@ -287,10 +320,10 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
-                     cfg=1.0, use_ema=True)
+                     cfg=1.0, use_ema=True, num_images=args.num_images_eval)
             if not (args.cfg == 1.0 or args.cfg == 0.0):
                 evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
-                         log_writer=log_writer, cfg=args.cfg, use_ema=True)
+                         log_writer=log_writer, cfg=args.cfg, use_ema=True, num_images=args.num_images_eval)
             torch.cuda.empty_cache()
 
         if misc.is_main_process():

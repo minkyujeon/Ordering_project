@@ -66,7 +66,7 @@ def train_one_epoch(model, vae,
 
         # forward
         with torch.cuda.amp.autocast():
-            loss = model(x, labels)
+            loss = model(x, labels, order_mode=args.order_mode)
 
         loss_value = loss.item()
 
@@ -102,15 +102,19 @@ def train_one_epoch(model, vae,
 
 
 def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
-             use_ema=True):
+             use_ema=True, num_images=None):
+    
+    if num_images is None:
+        num_images = args.num_images
+        
     model_without_ddp.eval()
-    num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
+    num_steps = num_images // (batch_size * misc.get_world_size()) + 1
     save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image{}".format(args.num_iter,
                                                                                                      args.num_sampling_steps,
                                                                                                      args.temperature,
                                                                                                      args.cfg_schedule,
                                                                                                      cfg,
-                                                                                                     args.num_images))
+                                                                                                     num_images))
     if use_ema:
         save_folder = save_folder + "_ema"
     if args.evaluate:
@@ -131,8 +135,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         model_without_ddp.load_state_dict(ema_state_dict)
 
     class_num = args.class_num
-    assert args.num_images % class_num == 0  # number of images per class must be the same
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+    assert num_images % class_num == 0  # number of images per class must be the same
+    class_label_gen_world = np.arange(0, class_num).repeat(num_images // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
@@ -155,7 +159,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             with torch.cuda.amp.autocast():
                 sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
                                                                  cfg_schedule=args.cfg_schedule, labels=labels_gen,
-                                                                 temperature=args.temperature)
+                                                                 temperature=args.temperature, order_mode=args.order_mode)
                 sampled_images = vae.decode(sampled_tokens / 0.2325)
 
         # measure speed after the first generation batch
@@ -172,7 +176,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         # distributed save
         for b_id in range(sampled_images.size(0)):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            if img_id >= args.num_images:
+            if img_id >= num_images:
                 break
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]

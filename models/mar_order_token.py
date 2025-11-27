@@ -1,5 +1,4 @@
 from functools import partial
-
 import numpy as np
 from tqdm import tqdm
 import scipy.stats as stats
@@ -7,21 +6,75 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-
 from timm.models.vision_transformer import Block
-
 from models.diffloss import DiffLoss
 
-
 def mask_by_order(mask_len, order, bsz, seq_len):
-    masking = torch.zeros(bsz, seq_len).cuda()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
-    return masking
+    """
+    Constructs binary mask (1=Masked, 0=Visible).
+    Indices in order[:, :mask_len] are masked.
+    """
+    device = order.device
+    if isinstance(mask_len, torch.Tensor):
+        mask_len = int(mask_len.item())
+    else:
+        mask_len = int(mask_len)
+
+    masking = torch.zeros(bsz, seq_len, device=device)
+    index = order[:, :mask_len] 
+    src = torch.ones_like(index, dtype=masking.dtype, device=device)
+    masking = masking.scatter(dim=-1, index=index, src=src)
+    return masking.bool()
+
+
+class TimmOrderHead(nn.Module):
+    """
+    Transformer-based Order Predictor.
+    Input: Projected Tokens [B, L, Dim] + Class Embed [B, Dim]
+    Output: Priority Scores [B, L]
+    """
+    def __init__(self, token_dim, depth=2, num_heads=4, mlp_ratio=4.0, 
+                 attn_dropout=0.0, proj_dropout=0.0):
+        super().__init__()
+        self.norm_in = nn.LayerNorm(token_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1, token_dim)) 
+
+        self.blocks = nn.ModuleList([
+            Block(dim=token_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, 
+                  qkv_bias=True, norm_layer=nn.LayerNorm, 
+                  proj_drop=proj_dropout, attn_drop=attn_dropout)
+            for _ in range(depth)
+        ])
+        self.norm_out = nn.LayerNorm(token_dim)
+        self.head = nn.Linear(token_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.head.weight, std=0.02)
+        if self.head.bias is not None:
+            nn.init.constant_(self.head.bias, 0)
+
+    def forward(self, x, class_emb):
+        # x: [B, L, D]
+        # class_emb: [B, D]
+        
+        # Condition on Class Information
+        x = x + class_emb.unsqueeze(1)
+        
+        x = self.norm_in(x)
+        if self.pos_embed is not None:
+            x = x + self.pos_embed.expand(x.size(0), x.size(1), -1)
+        
+        for blk in self.blocks:
+            x = blk(x)
+            
+        x = self.norm_out(x)
+        return self.head(x).squeeze(-1) # [B, L]
 
 
 class MAR(nn.Module):
-    """ Masked Autoencoder with VisionTransformer backbone
-    """
     def __init__(self, img_size=256, vae_stride=16, patch_size=1,
                  encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
                  decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
@@ -41,10 +94,7 @@ class MAR(nn.Module):
                  ):
         super().__init__()
 
-        # --------------------------------------------------------------------------
-        # VAE and patchify specifics
         self.vae_embed_dim = vae_embed_dim
-
         self.img_size = img_size
         self.vae_stride = vae_stride
         self.patch_size = patch_size
@@ -53,46 +103,44 @@ class MAR(nn.Module):
         self.token_embed_dim = vae_embed_dim * patch_size**2
         self.grad_checkpointing = grad_checkpointing
 
-        # --------------------------------------------------------------------------
-        # Class Embedding
-        self.num_classes = class_num
         self.class_emb = nn.Embedding(class_num, encoder_embed_dim)
-        self.label_drop_prob = label_drop_prob
-        # Fake class embedding for CFG's unconditional generation
         self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
-
-        # --------------------------------------------------------------------------
-        # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
+        self.label_drop_prob = label_drop_prob
+        
         self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
 
-        # --------------------------------------------------------------------------
-        # MAR encoder specifics
+        # Encoder
         self.z_proj = nn.Linear(self.token_embed_dim, encoder_embed_dim, bias=True)
         self.z_proj_ln = nn.LayerNorm(encoder_embed_dim, eps=1e-6)
         self.buffer_size = buffer_size
         self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_embed_dim))
-
         self.encoder_blocks = nn.ModuleList([
             Block(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
                   proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(encoder_depth)])
         self.encoder_norm = norm_layer(encoder_embed_dim)
 
-        # --------------------------------------------------------------------------
-        # MAR decoder specifics
+        # Decoder
         self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_embed_dim))
-
         self.decoder_blocks = nn.ModuleList([
             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
                   proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
-
         self.decoder_norm = norm_layer(decoder_embed_dim)
         self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len, decoder_embed_dim))
 
-        self.initialize_weights()
-
         # --------------------------------------------------------------------------
+        # The Dynamic Order Head (Uses ENCODER Dim)
+        # --------------------------------------------------------------------------
+        self.order_head = TimmOrderHead(
+            token_dim=encoder_embed_dim,
+            depth=4,
+            num_heads=4,
+            mlp_ratio=4,
+            attn_dropout=attn_dropout,
+            proj_dropout=proj_dropout
+        )
+
         # Diffusion Loss
         self.diffloss = DiffLoss(
             target_channels=self.token_embed_dim,
@@ -103,22 +151,20 @@ class MAR(nn.Module):
             grad_checkpointing=grad_checkpointing
         )
         self.diffusion_batch_mul = diffusion_batch_mul
+        
+        self.initialize_weights()
 
     def initialize_weights(self):
-        # parameters
         torch.nn.init.normal_(self.class_emb.weight, std=.02)
         torch.nn.init.normal_(self.fake_latent, std=.02)
         torch.nn.init.normal_(self.mask_token, std=.02)
         torch.nn.init.normal_(self.encoder_pos_embed_learned, std=.02)
         torch.nn.init.normal_(self.decoder_pos_embed_learned, std=.02)
         torch.nn.init.normal_(self.diffusion_pos_embed_learned, std=.02)
-
-        # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -132,99 +178,74 @@ class MAR(nn.Module):
         bsz, c, h, w = x.shape
         p = self.patch_size
         h_, w_ = h // p, w // p
-
         x = x.reshape(bsz, c, h_, p, w_, p)
         x = torch.einsum('nchpwq->nhwcpq', x)
         x = x.reshape(bsz, h_ * w_, c * p ** 2)
-        return x  # [n, l, d]
+        return x
 
     def unpatchify(self, x):
         bsz = x.shape[0]
         p = self.patch_size
         c = self.vae_embed_dim
         h_, w_ = self.seq_h, self.seq_w
-
         x = x.reshape(bsz, h_, w_, c, p, p)
         x = torch.einsum('nhwcpq->nchpwq', x)
         x = x.reshape(bsz, c, h_ * p, w_ * p)
-        return x  # [n, c, h, w]
+        return x
 
-    def sample_orders(self, bsz):
-        # generate a batch of random generation orders
+    def sample_random_orders(self, bsz):
+        device = self.encoder_pos_embed_learned.device
         orders = []
         for _ in range(bsz):
-            order = np.array(list(range(self.seq_len)))
+            order = np.arange(self.seq_len)
             np.random.shuffle(order)
             orders.append(order)
-        orders = torch.Tensor(np.array(orders)).cuda().long()
-        return orders
+        return torch.as_tensor(np.stack(orders), device=device, dtype=torch.long)
 
     def random_masking(self, x, orders):
-        # generate token mask
         bsz, seq_len, embed_dim = x.shape
         mask_rate = self.mask_ratio_generator.rvs(1)[0]
         num_masked_tokens = int(np.ceil(seq_len * mask_rate))
         mask = torch.zeros(bsz, seq_len, device=x.device)
-        mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
-                             src=torch.ones(bsz, seq_len, device=x.device))
+        mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens], src=torch.ones(bsz, seq_len, device=x.device))
         return mask
 
     def forward_mae_encoder(self, x, mask, class_embedding):
         x = self.z_proj(x)
         bsz, seq_len, embed_dim = x.shape
-
-        # concat buffer
         x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
 
-        # random drop class embedding during training
         if self.training:
-            drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
+            drop_latent_mask = torch.rand(bsz, device=x.device) < self.label_drop_prob
+            drop_latent_mask = drop_latent_mask.unsqueeze(-1).to(x.dtype)
             class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
 
         x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
-
-        # encoder position embedding
         x = x + self.encoder_pos_embed_learned
         x = self.z_proj_ln(x)
-
-        # dropping
         x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
 
-        # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.encoder_blocks:
-                x = checkpoint(block, x)
+            for block in self.encoder_blocks: x = checkpoint(block, x)
         else:
-            for block in self.encoder_blocks:
-                x = block(x)
+            for block in self.encoder_blocks: x = block(x)
         x = self.encoder_norm(x)
-
         return x
 
     def forward_mae_decoder(self, x, mask):
-
         x = self.decoder_embed(x)
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
-
-        # pad mask tokens
         mask_tokens = self.mask_token.repeat(mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
-        x_after_pad = mask_tokens.clone()
-        x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        x_full = mask_tokens.clone()
+        x_full[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        x_full = x_full + self.decoder_pos_embed_learned
 
-        # decoder position embedding
-        x = x_after_pad + self.decoder_pos_embed_learned
-
-        # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.decoder_blocks:
-                x = checkpoint(block, x)
+            for block in self.decoder_blocks: x_full = checkpoint(block, x_full)
         else:
-            for block in self.decoder_blocks:
-                x = block(x)
-        x = self.decoder_norm(x)
-
+            for block in self.decoder_blocks: x_full = block(x_full)
+        x = self.decoder_norm(x_full)
         x = x[:, self.buffer_size:]
         x = x + self.diffusion_pos_embed_learned
         return x
@@ -237,30 +258,162 @@ class MAR(nn.Module):
         loss = self.diffloss(z=z, target=target, mask=mask)
         return loss
 
-    def forward(self, imgs, labels):
+    def forward_oneshot_tokens_gumbel(self, imgs, labels, gumbel_scale=1.0):
+        x_tokens = self.patchify(imgs)
+        gt_latents = x_tokens.clone().detach()
+        
+        with torch.no_grad():
+            gt_latents_proj = self.z_proj(gt_latents)
 
-        # class embed
+        orders = self.sample_random_orders(bsz=imgs.size(0))
+        mask = self.random_masking(x_tokens, orders) # 1=Masked
+
+        with torch.no_grad():
+            if labels is None:
+                class_embedding = self.fake_latent.repeat(imgs.shape[0], 1)
+            else:
+                class_embedding = self.class_emb(labels)
+            
+            x_enc = self.forward_mae_encoder(x_tokens, mask, class_embedding)
+            z_dec = self.forward_mae_decoder(x_enc, mask)
+            recon_error = torch.mean((z_dec - gt_latents_proj)**2, dim=-1) 
+            mean_err = recon_error.mean(dim=1, keepdim=True)
+            std_err = recon_error.std(dim=1, keepdim=True) + 1e-6
+            normalized_error = (recon_error - mean_err) / std_err
+
+        # --- Prepare Input for Head (Visible + Zeroed Masked) ---
+        tokens_masked_input = x_tokens * (1 - mask.unsqueeze(-1))
+        
+        # Project to Model Dim (16 -> 1024) using frozen z_proj
+        tokens_proj = self.z_proj(tokens_masked_input)
+        pos_embed = self.encoder_pos_embed_learned[:, self.buffer_size:, :]
+        tokens_proj = tokens_proj + pos_embed
+
+        # Predict Scores
+        scores = self.order_head(tokens_proj, class_embedding.detach()) # [B, L]
+        
+        # Gumbel Selection
+        # Use -1e4 for FP16 safety
+        masked_scores = scores.masked_fill(~mask.bool(), -1e4)
+        
+        u = torch.rand_like(masked_scores, dtype=torch.float32)
+        g = -torch.log(-torch.log(u + 1e-9) + 1e-9)
+        g = g.to(masked_scores.dtype)
+        
+        selection_probs = torch.softmax(masked_scores + gumbel_scale * g, dim=-1)
+        loss_ordering = (selection_probs * normalized_error).sum(dim=-1).mean()
+        
+        return loss_ordering
+    
+    def forward(self, imgs, labels, order_mode='random', **kwargs):
+        if order_mode == 'gradient':
+            return self.forward_oneshot_tokens_gumbel(imgs, labels, **kwargs)
+        
+        # Standard MAR
         class_embedding = self.class_emb(labels)
-
-        # patchify and mask (drop) tokens
         x = self.patchify(imgs)
         gt_latents = x.clone().detach()
-        orders = self.sample_orders(bsz=x.size(0))
+        orders = self.sample_random_orders(bsz=x.size(0))
         mask = self.random_masking(x, orders)
-
-        # mae encoder
-        x = self.forward_mae_encoder(x, mask, class_embedding)
-
-        # mae decoder
-        z = self.forward_mae_decoder(x, mask)
-
-        # diffloss
+        x_enc = self.forward_mae_encoder(x, mask, class_embedding)
+        z = self.forward_mae_decoder(x_enc, mask)
         loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
-
         return loss
 
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
+    # --------------------------------------------------------------------------
+    # 3. NEW: DYNAMIC SAMPLING USING TOKENS AS INPUT
+    # --------------------------------------------------------------------------
+    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False, order_mode='random'):
+        
+        if order_mode == 'random':
+             return self._sample_tokens_random(bsz, num_iter, cfg, cfg_schedule, labels, temperature, progress)
 
+        # DYNAMIC SAMPLER
+        device = self.fake_latent.device
+        mask = torch.ones(bsz, self.seq_len, device=device)
+        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim, device=device)
+        
+        indices = list(range(num_iter))
+        if progress: indices = tqdm(indices)
+
+        for step in indices:
+            # 1. Context
+            if labels is not None:
+                class_embedding = self.class_emb(labels)
+            else:
+                class_embedding = self.fake_latent.repeat(bsz, 1)
+
+            # 2. Prepare Head Input (Current Tokens)
+            # Head sees [Visible Tokens] + [Zeros] + [Class]
+            
+            # Handle CFG batch size
+            if cfg != 1.0:
+                tokens_in = torch.cat([tokens, tokens], dim=0)
+                class_emb_in = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
+                mask_in = torch.cat([mask, mask], dim=0)
+            else:
+                tokens_in = tokens
+                class_emb_in = class_embedding
+                mask_in = mask
+
+            # Project & Add Pos Embed
+            # Note: tokens are already [B, L, 16]. 
+            # Masked positions are 0 (which is what we want).
+            x_head = self.z_proj(tokens_in)
+            pos_embed = self.encoder_pos_embed_learned[:, self.buffer_size:, :]
+            x_head = x_head + pos_embed
+            
+            # 3. Predict Scores
+            scores = self.order_head(x_head, class_emb_in) # [B, L]
+
+            # 4. Determine Next Mask
+            mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+            target_k = int(np.floor(self.seq_len * mask_ratio))
+            target_k = max(1, min(int(mask[0].sum().item()) - 1, target_k))
+            
+            # Sorting:
+            # Visible -> Top (Keep visible)
+            # Masked -> Sorted by Score (Top scores unmasked first)
+            sort_key = scores + (1 - mask_in) * 1e4
+            argsort = torch.argsort(sort_key, dim=-1, descending=True)
+            
+            # Keep the bottom 'target_k' masked
+            hardest_indices = argsort[:, -target_k:]
+            mask_next = torch.zeros_like(mask_in)
+            mask_next.scatter_(1, hardest_indices, 1.0)
+            
+            if step >= num_iter - 1:
+                mask_to_pred = mask_in.bool()
+            else:
+                mask_to_pred = (mask_in.bool() & (~mask_next.bool()))
+            mask = mask_next[:bsz]
+
+            # 5. Run MAR Body to sample
+            # Standard MAR step
+            x_enc = self.forward_mae_encoder(tokens_in, mask_in, class_emb_in)
+            z_dec = self.forward_mae_decoder(x_enc, mask_in)
+            
+            z_sample = z_dec[mask_to_pred.nonzero(as_tuple=True)]
+            
+            if cfg_schedule == "linear":
+                cfg_iter = 1 + (cfg - 1) * (self.seq_len - target_k) / self.seq_len
+            else:
+                cfg_iter = cfg
+            
+            sampled = self.diffloss.sample(z_sample, temperature, cfg_iter)
+            
+            if cfg != 1.0:
+                sampled, _ = sampled.chunk(2, dim=0)
+                mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+                mask = mask.chunk(2, dim=0)[0]
+
+            # Update tokens with new samples
+            tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled
+
+        return self.unpatchify(tokens)
+
+
+    def _sample_tokens_random(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
         # init and sample generation orders
         mask = torch.ones(bsz, self.seq_len).cuda()
         tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
