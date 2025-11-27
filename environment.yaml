@@ -1,4 +1,4 @@
-name: mar
+name: mar_orders
 channels:
   - pytorch
   - defaults
