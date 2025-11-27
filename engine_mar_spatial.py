@@ -256,21 +256,6 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
         log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-        
-        # -------- NEW: wandb logging for FID / IS --------
-        if use_wandb and misc.is_main_process():
-            wandb.log(
-                {
-                    f'fid{postfix}': float(fid),
-                    f'is{postfix}': float(inception_score),
-                    'epoch': epoch,
-                    'cfg': float(cfg),
-                    'use_ema': int(use_ema),
-                },
-                step=epoch,
-            )
-        # -------------------------------------------------
-        
         # remove temporal saving folder
         shutil.rmtree(save_folder)
 
