@@ -1,27 +1,32 @@
 from functools import partial
-
+import math
 import numpy as np
 from tqdm import tqdm
 import scipy.stats as stats
-import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-
 from timm.models.vision_transformer import Block
-
 from models.diffloss import DiffLoss
 
-
 def mask_by_order(mask_len, order, bsz, seq_len):
-    masking = torch.zeros(bsz, seq_len).cuda()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
-    return masking
+    device = order.device
 
+    if isinstance(mask_len, torch.Tensor):
+        mask_len = int(mask_len.item())
+    else:
+        mask_len = int(mask_len)
+
+    masking = torch.zeros(bsz, seq_len, device=device)
+
+    index = order[:, :mask_len]  # [B, K]
+    src   = torch.ones_like(index, dtype=masking.dtype, device=device)  # [B, K]
+
+    masking = masking.scatter(dim=-1, index=index, src=src)
+    return masking.bool()
 
 class MAR(nn.Module):
-    """ Masked Autoencoder with VisionTransformer backbone
-    """
+    """ Masked Autoencoder with VisionTransformer backbone """
     def __init__(self, img_size=256, vae_stride=16, patch_size=1,
                  encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
                  decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
@@ -44,7 +49,6 @@ class MAR(nn.Module):
         # --------------------------------------------------------------------------
         # VAE and patchify specifics
         self.vae_embed_dim = vae_embed_dim
-
         self.img_size = img_size
         self.vae_stride = vae_stride
         self.patch_size = patch_size
@@ -58,11 +62,10 @@ class MAR(nn.Module):
         self.num_classes = class_num
         self.class_emb = nn.Embedding(class_num, encoder_embed_dim)
         self.label_drop_prob = label_drop_prob
-        # Fake class embedding for CFG's unconditional generation
         self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
 
         # --------------------------------------------------------------------------
-        # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
+        # MAR variant masking ratio
         self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
 
         # --------------------------------------------------------------------------
@@ -103,6 +106,7 @@ class MAR(nn.Module):
             grad_checkpointing=grad_checkpointing
         )
         self.diffusion_batch_mul = diffusion_batch_mul
+        self._register_static_grids()
 
     def initialize_weights(self):
         # parameters
@@ -128,6 +132,21 @@ class MAR(nn.Module):
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1.0)
 
+    def _register_static_grids(self):
+        """Pre-calculate coordinate grids for spatial ordering"""
+        h, w = self.seq_h, self.seq_w
+        cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+        
+        y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+        y = y.flatten()
+        x = x.flatten()
+        
+        r2 = (y - cy)**2 + (x - cx)**2
+        theta = torch.atan2(y - cy, x - cx)
+        
+        self.register_buffer('grid_r2', r2)
+        self.register_buffer('grid_theta', theta)
+
     def patchify(self, x):
         bsz, c, h, w = x.shape
         p = self.patch_size
@@ -149,15 +168,214 @@ class MAR(nn.Module):
         x = x.reshape(bsz, c, h_ * p, w_ * p)
         return x  # [n, c, h, w]
 
-    def sample_orders(self, bsz):
-        # generate a batch of random generation orders
+
+    # ==========================================================================
+    # ORDERING LOGIC
+    # ==========================================================================
+
+    def sample_orders_new(self, bsz, mode="random", random_block_order=False, random_within_block=False):
+        device = self.encoder_pos_embed_learned.device
+        
+        if mode == "center_spiral":
+            # Generates Center -> Out
+            # We want Center at END of order array to be unmasked first.
+            # r2 sort Descending: Edge (Big r2) ... Center (Small r2)
+            return self.sample_orders_spiral(bsz, descending=True)
+            
+        elif mode == "edge_spiral":
+            # Generates Edge -> In
+            # We want Edge at END of order array.
+            # r2 sort Ascending: Center (Small r2) ... Edge (Big r2)
+            return self.sample_orders_spiral(bsz, descending=False)
+
+        elif mode == "blockwise":
+            return self.sample_orders_blockwise(bsz, random_block_order=random_block_order, 
+                                                random_within_block=random_within_block)
+        
+        elif mode == "multiscale":
+            return self.sample_orders_multiscale(bsz)
+        
+        elif mode == "center_perturb":
+            return self.sample_orders_center_out_with_perturb(bsz)
+            
+        else:
+            # Original fully-random order
+            orders = []
+            for _ in range(bsz):
+                # Fast GPU permutation
+                orders.append(torch.randperm(self.seq_len, device=device))
+            return torch.stack(orders)
+
+    def sample_orders_spiral(self, bsz, descending=True):
+        """
+        Vectorized Spiral Ordering.
+        descending=True  => [Edge ... Center] => Reveals Center First (Center-Out)
+        descending=False => [Center ... Edge] => Reveals Edge First (Edge-In)
+        """
+        # Use pre-calculated buffers
+        r2 = self.grid_r2
+        theta = self.grid_theta
+        
+        # Combine radius and angle for sorting key
+        # Add small noise to angle to break perfect symmetries
+        score = r2 + (theta + math.pi) / (2 * math.pi + 1e-6) * 0.1
+        
+        # Sort
+        _, indices = torch.sort(score, descending=descending)
+        
+        return indices.unsqueeze(0).repeat(bsz, 1)
+
+    def sample_orders_blockwise(self, bsz, block_h=4, block_w=4,
+                            random_block_order=False,
+                            random_within_block=False):
+        """
+        Blockwise ordering:
+        - First choose an order over blocks (block grid),
+        - Then choose an order of tokens within each block.
+        """
+        device = self.encoder_pos_embed_learned.device
+        H, W = self.seq_h, self.seq_w
+
+        # compute block grid size
+        n_blocks_h = (H + block_h - 1) // block_h
+        n_blocks_w = (W + block_w - 1) // block_w
+
+        # list all blocks by (block_row, block_col, block_id)
+        blocks = []
+        for bh in range(n_blocks_h):
+            for bw in range(n_blocks_w):
+                block_id = bh * n_blocks_w + bw
+                blocks.append((bh, bw, block_id))
+
+        base_block_ids = np.arange(len(blocks))
+
         orders = []
         for _ in range(bsz):
-            order = np.array(list(range(self.seq_len)))
-            np.random.shuffle(order)
-            orders.append(order)
-        orders = torch.Tensor(np.array(orders)).cuda().long()
-        return orders
+            # choose block order
+            if random_block_order:
+                block_order = base_block_ids.copy()
+                np.random.shuffle(block_order)
+            else:
+                block_order = base_block_ids  # fixed scan
+
+            token_order = []
+            for bid in block_order:
+                bh, bw, _ = blocks[bid]
+                h_start = bh * block_h
+                w_start = bw * block_w
+                h_end = min(h_start + block_h, H)
+                w_end = min(w_start + block_w, W)
+
+                # all tokens in this block
+                block_tokens = []
+                for i in range(h_start, h_end):
+                    for j in range(w_start, w_end):
+                        idx = i * W + j
+                        block_tokens.append(idx)
+
+                block_tokens = np.array(block_tokens, dtype=np.int64)
+                if random_within_block:
+                    np.random.shuffle(block_tokens)
+
+                token_order.extend(block_tokens.tolist())
+
+            orders.append(token_order)
+
+        # Convert to tensor on the correct device
+        return torch.as_tensor(np.stack(orders), device=device, dtype=torch.long)
+
+    def sample_orders_multiscale(self, bsz, strides=(4, 2, 1), shuffle_within_level=True):
+        """
+        Multiscale center-ish order:
+        - At stride s, pick a sub-grid of positions,
+        - Sort by center distance within each scale,
+        - Coarse scales first, fine scales later.
+        """
+        device = self.encoder_pos_embed_learned.device
+        H, W = self.seq_h, self.seq_w
+        cy = (H - 1) / 2.0
+        cx = (W - 1) / 2.0
+
+        used = set()
+        levels = []  # list of lists of idx
+
+        for s in strides:
+            level_idxs = []
+            # choose representative positions at stride s
+            for i in range(0, H, s):
+                for j in range(0, W, s):
+                    idx = i * W + j
+                    if idx in used:
+                        continue
+                    used.add(idx)
+                    di = i - cy
+                    dj = j - cx
+                    r2 = di * di + dj * dj
+                    level_idxs.append((r2, idx))
+            level_idxs.sort(key=lambda x: x[0])
+            level_ids = [idx for (_, idx) in level_idxs]
+            levels.append(level_ids)
+
+        # any remaining positions not covered (just in case)
+        remaining = []
+        for i in range(H):
+            for j in range(W):
+                idx = i * W + j
+                if idx not in used:
+                    di = i - cy
+                    dj = j - cx
+                    r2 = di * di + dj * dj
+                    remaining.append((r2, idx))
+        remaining.sort(key=lambda x: x[0])
+        rem_ids = [idx for (_, idx) in remaining]
+        if rem_ids:
+            levels.append(rem_ids)
+
+        # now build per-batch orders
+        orders = []
+        for _ in range(bsz):
+            order = []
+            for lvl in levels:
+                lvl_arr = np.array(lvl, dtype=np.int64)
+                if shuffle_within_level:
+                    np.random.shuffle(lvl_arr)
+                order.extend(lvl_arr.tolist())
+            # To ensure Center-Out (Center revealed first), Center must be at END.
+            # Currently, levels are sorted by r2 (Small r2 first).
+            # So `order` starts with Center (Small r2) and ends with Edge.
+            # Masking logic masks Prefix.
+            # So Center is Masked. Edge is Unmasked first.
+            # This is Edge-In.
+            # To get Center-Out, we reverse the order.
+            orders.append(order[::-1])
+
+        return torch.as_tensor(np.stack(orders), device=device, dtype=torch.long)
+
+    def sample_orders_center_out_with_perturb(self, bsz, swap_frac=0.1):
+        """
+        Center -> edge base order, then per-image random perturbations
+        via random swaps.
+        """
+        # Base Center Out
+        # Descending sort of R2 gives [Edge ... Center]. 
+        # Center is at Tail -> Revealed First.
+        base_order = self.sample_orders_spiral(1, descending=True)[0] # [L]
+        
+        # Perturbation logic in numpy/cpu for flexibility
+        orders = []
+        base_np = base_order.cpu().numpy()
+        L = len(base_np)
+        n_swaps = int(L * swap_frac)
+        
+        for _ in range(bsz):
+            o = base_np.copy()
+            for _ in range(n_swaps):
+                i = np.random.randint(0, L)
+                j = np.random.randint(0, L)
+                o[i], o[j] = o[j], o[i]
+            orders.append(o)
+            
+        return torch.as_tensor(np.stack(orders), device=self.encoder_pos_embed_learned.device, dtype=torch.long)
 
     def random_masking(self, x, orders):
         # generate token mask
@@ -165,6 +383,12 @@ class MAR(nn.Module):
         mask_rate = self.mask_ratio_generator.rvs(1)[0]
         num_masked_tokens = int(np.ceil(seq_len * mask_rate))
         mask = torch.zeros(bsz, seq_len, device=x.device)
+        
+        # Mask the PREFIX. 
+        # If Order = [A, B, C, D] and we mask 2.
+        # Masked: A, B. Visible: C, D.
+        # In inference, we go from All Masked -> Zero Masked.
+        # We reveal the SUFFIX first.
         mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
                              src=torch.ones(bsz, seq_len, device=x.device))
         return mask
@@ -229,6 +453,7 @@ class MAR(nn.Module):
         x = x + self.diffusion_pos_embed_learned
         return x
 
+
     def forward_loss(self, z, target, mask):
         bsz, seq_len, _ = target.shape
         target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
@@ -237,97 +462,97 @@ class MAR(nn.Module):
         loss = self.diffloss(z=z, target=target, mask=mask)
         return loss
 
-    def forward(self, imgs, labels):
-
-        # class embed
+    def forward(self, imgs, labels, order_mode='random', random_block_order=False, random_within_block=False):
         class_embedding = self.class_emb(labels)
-
-        # patchify and mask (drop) tokens
         x = self.patchify(imgs)
         gt_latents = x.clone().detach()
-        orders = self.sample_orders(bsz=x.size(0))
+        
+        # Generate orders based on requested mode
+        orders = self.sample_orders_new(bsz=x.size(0), mode=order_mode,
+                                        random_block_order=random_block_order, 
+                                        random_within_block=random_within_block)
         mask = self.random_masking(x, orders)
 
-        # mae encoder
-        x = self.forward_mae_encoder(x, mask, class_embedding)
-
-        # mae decoder
-        z = self.forward_mae_decoder(x, mask)
-
-        # diffloss
+        x_enc = self.forward_mae_encoder(x, mask, class_embedding)
+        z = self.forward_mae_decoder(x_enc, mask)
         loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
 
         return loss
 
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
+    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False, order_mode='random',
+                      random_block_order=False, random_within_block=False):
 
-        # init and sample generation orders
         mask = torch.ones(bsz, self.seq_len).cuda()
         tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
-        orders = self.sample_orders(bsz)
+        
+        # One-time order generation
+        orders = self.sample_orders_new(bsz, mode=order_mode,
+                                        random_block_order=random_block_order, 
+                                        random_within_block=random_within_block)
 
         indices = list(range(num_iter))
-        if progress:
-            indices = tqdm(indices)
-        # generate latents
+        if progress: indices = tqdm(indices)
+        
         for step in indices:
             cur_tokens = tokens.clone()
 
-            # class embedding and CFG
             if labels is not None:
                 class_embedding = self.class_emb(labels)
             else:
                 class_embedding = self.fake_latent.repeat(bsz, 1)
             if not cfg == 1.0:
-                tokens = torch.cat([tokens, tokens], dim=0)
+                tokens_in = torch.cat([tokens, tokens], dim=0)
                 class_embedding = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
-                mask = torch.cat([mask, mask], dim=0)
+                mask_in = torch.cat([mask, mask], dim=0)
+            else:
+                tokens_in = tokens
+                mask_in = mask
 
-            # mae encoder
-            x = self.forward_mae_encoder(tokens, mask, class_embedding)
+            x = self.forward_mae_encoder(tokens_in, mask_in, class_embedding)
+            z = self.forward_mae_decoder(x, mask_in)
 
-            # mae decoder
-            z = self.forward_mae_decoder(x, mask)
-
-            # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
             mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
-
-            # masks out at least one for the next iteration
             mask_len = torch.maximum(torch.Tensor([1]).cuda(),
                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
 
-            # get masking for next iteration and locations to be predicted in this iteration
-            mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
-            if step >= num_iter - 1:
-                mask_to_pred = mask[:bsz].bool()
+            # Handle CFG batch size mismatch
+            if cfg != 1.0:
+                orders_inference = torch.cat([orders, orders], dim=0)
             else:
-                mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
-            mask = mask_next
-            if not cfg == 1.0:
-                mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+                orders_inference = orders
 
-            # sample token latents for this step
-            z = z[mask_to_pred.nonzero(as_tuple=True)]
-            # cfg schedule follow Muse
+            mask_next = mask_by_order(mask_len[0], orders_inference, mask_in.shape[0], self.seq_len)
+            
+            if step >= num_iter - 1:
+                mask_to_pred = mask_in.bool()
+            else:
+                mask_to_pred = torch.logical_xor(mask_in.bool(), mask_next.bool())
+            
+            mask = mask_next
+            
+            if not cfg == 1.0:
+                mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0) if mask_to_pred.shape[0] != z.shape[0] else mask_to_pred
+
+            z_step = z[mask_to_pred.nonzero(as_tuple=True)]
+            
             if cfg_schedule == "linear":
                 cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
-            elif cfg_schedule == "constant":
-                cfg_iter = cfg
             else:
-                raise NotImplementedError
-            sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+                cfg_iter = cfg
+                
+            sampled_token_latent = self.diffloss.sample(z_step, temperature, cfg_iter)
+            
             if not cfg == 1.0:
-                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
+                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)
                 mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+                mask = mask.chunk(2, dim=0)[0]
 
             cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
             tokens = cur_tokens.clone()
 
-        # unpatchify
         tokens = self.unpatchify(tokens)
         return tokens
-
 
 def mar_base(**kwargs):
     model = MAR(
@@ -336,14 +561,12 @@ def mar_base(**kwargs):
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
-
 def mar_large(**kwargs):
     model = MAR(
         encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
         decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
-
 
 def mar_huge(**kwargs):
     model = MAR(

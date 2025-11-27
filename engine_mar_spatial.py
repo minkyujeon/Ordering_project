@@ -14,7 +14,12 @@ import numpy as np
 import os
 import copy
 import time
-
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    _WANDB_AVAILABLE = False
 
 def update_ema(target_params, source_params, rate=0.99):
     """
@@ -34,14 +39,17 @@ def train_one_epoch(model, vae,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
                     log_writer=None,
-                    args=None):
+                    args=None,
+                    use_wandb=False):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 20
 
-    optimizer.zero_grad()
+    # optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+    accum_steps = getattr(args, "accum_steps", 1)
 
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
@@ -66,7 +74,10 @@ def train_one_epoch(model, vae,
 
         # forward
         with torch.cuda.amp.autocast():
-            loss = model(x, labels)
+            loss = model(x, labels, order_mode=args.order_mode, 
+                         random_block_order=args.random_block_order,
+                         random_within_block=args.random_within_block) / accum_steps
+            # loss = model(x, labels)
 
         loss_value = loss.item()
 
@@ -74,12 +85,24 @@ def train_one_epoch(model, vae,
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
-        loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
-        optimizer.zero_grad()
+        # loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
+        # optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
-        update_ema(ema_params, model_params, rate=args.ema_rate)
+        # update_ema(ema_params, model_params, rate=args.ema_rate)
+        do_update = ((data_iter_step + 1) % accum_steps == 0)
+        loss_scaler(
+            loss, optimizer,
+            clip_grad=args.grad_clip,
+            parameters=model.parameters(),
+            update_grad=do_update
+        )
+        if do_update:
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            update_ema(ema_params, model_params, rate=args.ema_rate)
+
 
         metric_logger.update(loss=loss_value)
 
@@ -94,6 +117,20 @@ def train_one_epoch(model, vae,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
+            
+        # -------- NEW: wandb per-iteration logging --------
+        if use_wandb and misc.is_main_process():
+            global_step = epoch * len(data_loader) + data_iter_step
+            if global_step % args.wandb_log_every == 0:
+                wandb.log(
+                    {
+                        'train/loss': float(loss_value_reduce),
+                        'train/lr': lr,
+                        'train/epoch': epoch,
+                    },
+                    step=global_step,
+                )
+        # ---------------------------------------------------
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -102,15 +139,19 @@ def train_one_epoch(model, vae,
 
 
 def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
-             use_ema=True):
+             use_ema=True, use_wandb=False, num_images=None):
+    
+    if num_images is None:
+        num_images = args.num_images
+        
     model_without_ddp.eval()
-    num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
+    num_steps = num_images // (batch_size * misc.get_world_size()) + 1
     save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image{}".format(args.num_iter,
                                                                                                      args.num_sampling_steps,
                                                                                                      args.temperature,
                                                                                                      args.cfg_schedule,
                                                                                                      cfg,
-                                                                                                     args.num_images))
+                                                                                                     num_images))
     if use_ema:
         save_folder = save_folder + "_ema"
     if args.evaluate:
@@ -131,8 +172,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         model_without_ddp.load_state_dict(ema_state_dict)
 
     class_num = args.class_num
-    assert args.num_images % class_num == 0  # number of images per class must be the same
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+    assert num_images % class_num == 0  # number of images per class must be the same
+    class_label_gen_world = np.arange(0, class_num).repeat(num_images // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
@@ -155,7 +196,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             with torch.cuda.amp.autocast():
                 sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
                                                                  cfg_schedule=args.cfg_schedule, labels=labels_gen,
-                                                                 temperature=args.temperature)
+                                                                 temperature=args.temperature, order_mode=args.order_mode,
+                                                                 random_block_order=args.random_block_order, random_within_block=args.random_within_block)
                 sampled_images = vae.decode(sampled_tokens / 0.2325)
 
         # measure speed after the first generation batch
@@ -172,7 +214,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         # distributed save
         for b_id in range(sampled_images.size(0)):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            if img_id >= args.num_images:
+            if img_id >= num_images:
                 break
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
@@ -214,6 +256,21 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
         log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
         print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+        
+        # -------- NEW: wandb logging for FID / IS --------
+        if use_wandb and misc.is_main_process():
+            wandb.log(
+                {
+                    f'fid{postfix}': float(fid),
+                    f'is{postfix}': float(inception_score),
+                    'epoch': epoch,
+                    'cfg': float(cfg),
+                    'use_ema': int(use_ema),
+                },
+                step=epoch,
+            )
+        # -------------------------------------------------
+        
         # remove temporal saving folder
         shutil.rmtree(save_folder)
 

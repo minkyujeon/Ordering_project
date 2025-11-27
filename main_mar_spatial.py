@@ -17,11 +17,18 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.loader import CachedFolder
 
 from models.vae import AutoencoderKL
-from models import mar
-from engine_mar import train_one_epoch, evaluate
+from models import mar_spatial
+from engine_mar_spatial import train_one_epoch, evaluate
 import copy
 
-
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    _WANDB_AVAILABLE = False
+    
+    
 def get_args_parser():
     parser = argparse.ArgumentParser('MAR training with Diffusion Loss', add_help=False)
     parser.add_argument('--batch_size', default=16, type=int,
@@ -49,6 +56,9 @@ def get_args_parser():
                         help='number of autoregressive iterations to generate an image')
     parser.add_argument('--num_images', default=50000, type=int,
                         help='number of images to generate')
+    parser.add_argument('--num_images_eval', default=5000, type=int,
+                        help='number of images to generate during online eval')
+
     parser.add_argument('--cfg', default=1.0, type=float, help="classifier-free guidance")
     parser.add_argument('--cfg_schedule', default="linear", type=str)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
@@ -58,10 +68,15 @@ def get_args_parser():
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--eval_bsz', type=int, default=64, help='generation batch size')
 
+    # Order mode
+    parser.add_argument('--order_mode', default="random", type=str)
+    parser.add_argument('--random_block_order', action='store_true')
+    parser.add_argument('--random_within_block', action='store_true')
+    # center_spiral, blockwise, multiscale, learnable, center_perturb
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.02,
                         help='weight decay (default: 0.02)')
-
+    parser.add_argument('--accum_steps', type=int, default=1, help='Gradient accumulation steps (to keep global batch size constant)')
     parser.add_argument('--grad_checkpointing', action='store_true')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
@@ -129,8 +144,67 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
+    
+    # ----------------- wandb logging -----------------
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', default='mar_spatial',
+                        help='W&B project name')
+    parser.add_argument('--wandb_run_name', default=None,
+                        help='W&B run name (optional)')
+    parser.add_argument('--wandb_group', default=None,
+                        help='W&B group name (optional)')
+    parser.add_argument('--wandb_tags', default='',
+                        help='Comma-separated list of tags')
+    parser.add_argument('--wandb_notes', default=None,
+                        help='W&B run notes')
+    parser.add_argument('--wandb_id', default=None,
+                        help='W&B run id (for resuming)')
+    parser.add_argument('--wandb_mode', default='offline',
+                        help='W&B mode: offline, online, disabled')
+    parser.add_argument('--wandb_log_every', type=int, default=100,
+                        help='Log train loss to W&B every N iterations')
+    # -------------------------------------------------
 
     return parser
+
+
+def _init_wandb(args, config_dict):
+    """Initialize wandb on main process. Returns True if active."""
+    if not args.wandb:
+        return False
+    if not _WANDB_AVAILABLE:
+        if misc.is_main_process():
+            print('[wandb] Not installed. Run `pip install wandb` to enable. Continuing without wandb...')
+        return False
+
+    if args.wandb_mode:
+        # e.g., 'offline' so it doesn't talk to the server during the run
+        os.environ['WANDB_MODE'] = args.wandb_mode
+
+    # Make a nice default name if none provided
+    auto_name = args.wandb_run_name or f"{args.model}-img{args.img_size}-bs{args.batch_size}-seed{args.seed}"
+
+    run = wandb.init(
+        project=args.wandb_project,
+        name=auto_name,
+        id=(args.wandb_id or None),
+        resume='allow' if args.wandb_id else None,
+        notes=(args.wandb_notes or None),
+        group=(args.wandb_group or None),
+        tags=[t.strip() for t in args.wandb_tags.split(',') if t.strip()] or None,
+        config=config_dict,
+        allow_val_change=True,
+        reinit=True,
+        settings=wandb.Settings(start_method='thread', _service_wait=300),
+    )
+
+    # Save code & env for reproducibility
+    if run is not None:
+        wandb.run.log_code(root='.', include_fn=lambda path: path.endswith(('.py', '.sh', '.yaml', '.yml')))
+
+    # We’ll use global `wandb` object in logging, so we only need a bool here
+    return run is not None
 
 
 def main(args):
@@ -156,6 +230,14 @@ def main(args):
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
+        
+    # -------- NEW: wandb init on main rank --------
+    if misc.is_main_process():
+        config_dict = vars(args).copy()
+        use_wandb = _init_wandb(args, config_dict)
+    else:
+        use_wandb = False
+    # ----------------------------------------------
 
     # augmentation following DiT and ADM
     transform_train = transforms.Compose([
@@ -189,7 +271,7 @@ def main(args):
     for param in vae.parameters():
         param.requires_grad = False
 
-    model = mar.__dict__[args.model](
+    model = mar_spatial.__dict__[args.model](
         img_size=args.img_size,
         vae_stride=args.vae_stride,
         patch_size=args.patch_size,
@@ -215,14 +297,16 @@ def main(args):
     model.to(device)
     model_without_ddp = model
 
-    eff_batch_size = args.batch_size * misc.get_world_size()
+    # eff_batch_size = args.batch_size * misc.get_world_size()
+    eff_batch_size = args.batch_size * misc.get_world_size() * args.accum_steps
+
 
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
     print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
-    print("effective batch size: %d" % eff_batch_size)
+    print("effective batch size (per optimizer step): %d" % eff_batch_size)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -237,7 +321,7 @@ def main(args):
     # resume training
     if args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth")):
         checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         model_params = list(model_without_ddp.parameters())
         ema_state_dict = checkpoint['model_ema']
         ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
@@ -245,7 +329,8 @@ def main(args):
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
-            args.start_epoch = checkpoint['epoch'] + 1
+            if args.start_epoch is None:
+                args.start_epoch = checkpoint['epoch'] + 1
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
             print("With optim & sched!")
@@ -259,7 +344,7 @@ def main(args):
     if args.evaluate:
         torch.cuda.empty_cache()
         evaluate(model_without_ddp, vae, ema_params, args, 0, batch_size=args.eval_bsz, log_writer=log_writer,
-                 cfg=args.cfg, use_ema=True)
+                 cfg=args.cfg, use_ema=True, use_wandb=use_wandb, num_images=args.num_images)
         return
 
     # training
@@ -269,28 +354,38 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(
+        train_stats = train_one_epoch(
             model, vae,
             model_params, ema_params,
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args,
+            use_wandb=use_wandb,
         )
+        
+        # Optional: per-epoch summary to wandb
+        if use_wandb and misc.is_main_process():
+            wandb.log(
+                {f'train_epoch/{k}': v for k, v in train_stats.items()},
+                step=(epoch + 1) * len(data_loader_train),
+            )
 
         # save checkpoint
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
-            misc.save_model(args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                            loss_scaler=loss_scaler, epoch=epoch, ema_params=ema_params, epoch_name="last")
+            misc.save_model(args=args, epoch=epoch, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                            loss_scaler=loss_scaler, ema_params=ema_params)
 
         # online evaluation
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz, log_writer=log_writer,
-                     cfg=1.0, use_ema=True)
+                     cfg=1.0, use_ema=True, use_wandb=use_wandb,
+                     num_images=args.num_images_eval)
             if not (args.cfg == 1.0 or args.cfg == 0.0):
                 evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=args.eval_bsz // 2,
-                         log_writer=log_writer, cfg=args.cfg, use_ema=True)
+                         log_writer=log_writer, cfg=args.cfg, use_ema=True, use_wandb=use_wandb,
+                         num_images=args.num_images_eval)
             torch.cuda.empty_cache()
 
         if misc.is_main_process():
@@ -300,6 +395,9 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    
+    if use_wandb and misc.is_main_process():
+        wandb.finish()
 
 
 if __name__ == '__main__':
