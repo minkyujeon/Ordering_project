@@ -224,10 +224,6 @@ class MAR(nn.Module):
             orders = self.sample_orders(bsz)
         else:
             raise ValueError(f"Unknown AR mode: {mode}")
-
-        # --- FIX: Sample ONE scalar timestep for the whole batch ---
-        # This ensures every item in the batch has the same number of visible tokens.
-        # So 'forward_mae_encoder' can successfully reshape to [Batch, Num_Visible, Dim].
         
         # Sample t from [0, seq_len - 1]
         # t represents the index of the token we are predicting right now.
@@ -382,8 +378,7 @@ class MAR(nn.Module):
             z = self.forward_mae_decoder(x, mask_in)
 
             # Identify target indices (step-th element in order)
-            # orders is [B, L]. We want the column at 'step'.
-            # But wait: orders[b, step] is the index of the token processed at 'step'.
+            # orders: [B, L].
             if cfg != 1.0:
                 # Repeat orders for CFG batch
                 orders_inf = torch.cat([orders, orders], dim=0)

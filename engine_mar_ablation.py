@@ -74,8 +74,6 @@ def train_one_epoch(model, vae,
         # forward
         with torch.cuda.amp.autocast():
             loss = model(x, labels, mode=args.mode)
-
-            # Divide loss by accumulation steps so gradients average out correctly
             loss = loss / accum_steps
             
         loss_value = loss.item()
