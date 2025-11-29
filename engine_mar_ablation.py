@@ -48,6 +48,7 @@ def train_one_epoch(model, vae,
     # Get accumulation steps (default to 1 if not provided)
     accum_steps = getattr(args, "accum_steps", 1)
     
+    # Zero grad at start of epoch
     optimizer.zero_grad()
 
     if log_writer is not None:
@@ -56,6 +57,8 @@ def train_one_epoch(model, vae,
     for data_iter_step, (samples, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
+        # Adjust LR only on update steps to be more precise, or every step is fine too.
+        # Standard practice is usually every step.
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         samples = samples.to(device, non_blocking=True)
@@ -73,28 +76,54 @@ def train_one_epoch(model, vae,
 
         # forward
         with torch.cuda.amp.autocast():
-            loss = model(x, labels, mode=args.mode)
-            loss = loss / accum_steps
+            loss = model(x, labels)
             
+            # --- GRADIENT ACCUMULATION FIX ---
+            # Divide loss by accumulation steps so gradients average out correctly
+            loss = loss / accum_steps
+
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
+            # Force sync to ensure logs are flushed
+            sys.stdout.flush()
+            # In distributed training, one rank failing causes others to hang/crash.
+            # We exit with error code to trigger SLURM restart or fail.
             sys.exit(1)
 
-        loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
-        optimizer.zero_grad()
+        # Determine if we update weights this step
+        is_update_step = ((data_iter_step + 1) % accum_steps == 0) or ((data_iter_step + 1) == len(data_loader))
 
-        torch.cuda.synchronize()
+        # Backward + Optimizer Step (only if is_update_step is True)
+        # Note: loss_scaler.scale(loss).backward() accumulates gradients if we don't zero_grad.
+        loss_scaler(
+            loss, optimizer, 
+            clip_grad=args.grad_clip, 
+            parameters=model.parameters(), 
+            update_grad=is_update_step
+        )
+        
+        if is_update_step:
+            optimizer.zero_grad()
+            # Update EMA only when model updates
+            update_ema(ema_params, model_params, rate=args.ema_rate)
 
-        update_ema(ema_params, model_params, rate=args.ema_rate)
-
-        metric_logger.update(loss=loss_value)
+        # --- LOGGING ---
+        # Multiply loss back by accum_steps for logging so it looks "normal" (comparable to batch size 64)
+        # However, be careful: if loss_value is already divided, multiplying it back gives the "per batch" loss.
+        logged_loss = loss_value * accum_steps
+        
+        # Sanity check for logging nan (just in case loss_value was finite but close to boundary)
+        if math.isfinite(logged_loss):
+             metric_logger.update(loss=logged_loss)
+        else:
+             metric_logger.update(loss=loss_value) # Fallback
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
-        loss_value_reduce = misc.all_reduce_mean(loss_value)
+        loss_value_reduce = misc.all_reduce_mean(logged_loss)
         global_step = data_iter_step + len(data_loader) * epoch
 
         if log_writer is not None:
@@ -119,15 +148,19 @@ def train_one_epoch(model, vae,
 
 
 def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log_writer=None, cfg=1.0,
-             use_ema=True, use_wandb=False):
+             use_ema=True, use_wandb=False, num_images=None):
+    
+    if num_images is None:
+        num_images = args.num_images
+        
     model_without_ddp.eval()
-    num_steps = args.num_images // (batch_size * misc.get_world_size()) + 1
+    num_steps = num_images // (batch_size * misc.get_world_size()) + 1
     save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-image{}".format(args.num_iter,
                                                                                                      args.num_sampling_steps,
                                                                                                      args.temperature,
                                                                                                      args.cfg_schedule,
                                                                                                      cfg,
-                                                                                                     args.num_images))
+                                                                                                     num_images))
     if use_ema:
         save_folder = save_folder + "_ema"
     if args.evaluate:
@@ -148,8 +181,8 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         model_without_ddp.load_state_dict(ema_state_dict)
 
     class_num = args.class_num
-    assert args.num_images % class_num == 0  # number of images per class must be the same
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+    assert num_images % class_num == 0  # number of images per class must be the same
+    class_label_gen_world = np.arange(0, class_num).repeat(num_images // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
@@ -170,14 +203,9 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         # generation
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                if args.mode == 'ar_raster' or args.mode == 'ar_random':
-                    sampled_tokens = model_without_ddp.sample_tokens_ar(bsz=batch_size, mode=args.mode, cfg=cfg,
-                                                                 labels=labels_gen,
-                                                                 temperature=args.temperature)
-                else:
-                    sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
-                                                                    cfg_schedule=args.cfg_schedule, labels=labels_gen,
-                                                                    temperature=args.temperature)
+                sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
+                                                                cfg_schedule=args.cfg_schedule, labels=labels_gen,
+                                                                temperature=args.temperature)
                 sampled_images = vae.decode(sampled_tokens / 0.2325)
 
         # measure speed after the first generation batch
@@ -194,7 +222,7 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
         # distributed save
         for b_id in range(sampled_images.size(0)):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            if img_id >= args.num_images:
+            if img_id >= num_images:
                 break
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
@@ -215,8 +243,6 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             fid_statistics_file = 'fid_stats/adm_in256_stats.npz'
         else:
             raise NotImplementedError
-        
-        # Fix for argument error: pass stats file as positional argument 2
         metrics_dict = torch_fidelity.calculate_metrics(
             save_folder, 
             fid_statistics_file,
@@ -227,7 +253,6 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
             prc=False,
             verbose=False,
         )
-        
         fid = metrics_dict['frechet_inception_distance']
         inception_score = metrics_dict['inception_score_mean']
         postfix = ""

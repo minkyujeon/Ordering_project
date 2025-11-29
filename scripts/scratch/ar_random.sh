@@ -67,8 +67,8 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --cpus-per-task=$SLURM_CPUS_PER_
       --resume $RESUME_DIR \
       --output_dir $OUTPUT_DIR \
       --data_path $IMAGENET_PATH \
-      --mode ar_random \
-      --use_wandb \
+      --wandb \
       --grad_checkpointing \
       --accum_steps 2 \
+      --generation_mode random_ar
 "

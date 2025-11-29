@@ -1,4 +1,5 @@
 from functools import partial
+
 import numpy as np
 from tqdm import tqdm
 import scipy.stats as stats
@@ -6,16 +7,24 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+
 from timm.models.vision_transformer import Block
+
 from models.diffloss import DiffLoss
+
 
 def mask_by_order(mask_len, order, bsz, seq_len):
     masking = torch.zeros(bsz, seq_len).cuda()
     masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
     return masking
 
+
 class MAR(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
+    Supports three generation modes:
+    - 'masked_ar': Original MAR (Figure 3c) - predicts multiple tokens simultaneously
+    - 'raster_ar': Standard raster-order AR (Figure 3a) - predicts one token at a time in raster order
+    - 'random_ar': Random-order AR (Figure 3b) - predicts one token at a time in random order
     """
     def __init__(self, img_size=256, vae_stride=16, patch_size=1,
                  encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
@@ -33,12 +42,14 @@ class MAR(nn.Module):
                  num_sampling_steps='100',
                  diffusion_batch_mul=4,
                  grad_checkpointing=False,
+                 generation_mode='masked_ar',  # New parameter
                  ):
         super().__init__()
 
         # --------------------------------------------------------------------------
         # VAE and patchify specifics
         self.vae_embed_dim = vae_embed_dim
+
         self.img_size = img_size
         self.vae_stride = vae_stride
         self.patch_size = patch_size
@@ -46,14 +57,18 @@ class MAR(nn.Module):
         self.seq_len = self.seq_h * self.seq_w
         self.token_embed_dim = vae_embed_dim * patch_size**2
         self.grad_checkpointing = grad_checkpointing
+        self.generation_mode = generation_mode
 
         # --------------------------------------------------------------------------
         # Class Embedding
         self.num_classes = class_num
         self.class_emb = nn.Embedding(class_num, encoder_embed_dim)
         self.label_drop_prob = label_drop_prob
+        # Fake class embedding for CFG's unconditional generation
         self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
 
+        # --------------------------------------------------------------------------
+        # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
         self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
 
         # --------------------------------------------------------------------------
@@ -96,16 +111,20 @@ class MAR(nn.Module):
         self.diffusion_batch_mul = diffusion_batch_mul
 
     def initialize_weights(self):
+        # parameters
         torch.nn.init.normal_(self.class_emb.weight, std=.02)
         torch.nn.init.normal_(self.fake_latent, std=.02)
         torch.nn.init.normal_(self.mask_token, std=.02)
         torch.nn.init.normal_(self.encoder_pos_embed_learned, std=.02)
         torch.nn.init.normal_(self.decoder_pos_embed_learned, std=.02)
         torch.nn.init.normal_(self.diffusion_pos_embed_learned, std=.02)
+
+        # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -119,22 +138,25 @@ class MAR(nn.Module):
         bsz, c, h, w = x.shape
         p = self.patch_size
         h_, w_ = h // p, w // p
+
         x = x.reshape(bsz, c, h_, p, w_, p)
         x = torch.einsum('nchpwq->nhwcpq', x)
         x = x.reshape(bsz, h_ * w_, c * p ** 2)
-        return x
+        return x  # [n, l, d]
 
     def unpatchify(self, x):
         bsz = x.shape[0]
         p = self.patch_size
         c = self.vae_embed_dim
         h_, w_ = self.seq_h, self.seq_w
+
         x = x.reshape(bsz, h_, w_, c, p, p)
         x = torch.einsum('nhwcpq->nchpwq', x)
         x = x.reshape(bsz, c, h_ * p, w_ * p)
-        return x
+        return x  # [n, c, h, w]
 
     def sample_orders(self, bsz):
+        # generate a batch of random generation orders
         orders = []
         for _ in range(bsz):
             order = np.array(list(range(self.seq_len)))
@@ -142,17 +164,30 @@ class MAR(nn.Module):
             orders.append(order)
         orders = torch.Tensor(np.array(orders)).cuda().long()
         return orders
-    
-    def sample_raster_orders(self, bsz):
-        order = np.arange(self.seq_len)
-        orders = np.tile(order, (bsz, 1))
-        orders = torch.Tensor(orders).cuda().long()
+
+    def get_raster_orders(self, bsz):
+        # generate raster-scan order (left-to-right, top-to-bottom)
+        order = np.array(list(range(self.seq_len)))
+        orders = torch.Tensor(np.array([order] * bsz)).cuda().long()
         return orders
 
     def random_masking(self, x, orders):
+        # generate token mask based on generation mode
         bsz, seq_len, embed_dim = x.shape
-        mask_rate = self.mask_ratio_generator.rvs(1)[0]
-        num_masked_tokens = int(np.ceil(seq_len * mask_rate))
+        
+        if self.generation_mode == 'masked_ar':
+            # Original MAR: random mask ratio
+            mask_rate = self.mask_ratio_generator.rvs(1)[0]
+            num_masked_tokens = int(np.ceil(seq_len * mask_rate))
+        elif self.generation_mode == 'random_ar':
+            # Random-order AR: mask all but one random token
+            num_masked_tokens = seq_len - 1
+        elif self.generation_mode == 'raster_ar':
+            # Raster-order AR: mask all but the first token in raster order
+            num_masked_tokens = seq_len - 1
+        else:
+            raise ValueError(f"Unknown generation_mode: {self.generation_mode}")
+        
         mask = torch.zeros(bsz, seq_len, device=x.device)
         mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
                              src=torch.ones(bsz, seq_len, device=x.device))
@@ -162,41 +197,58 @@ class MAR(nn.Module):
         x = self.z_proj(x)
         bsz, seq_len, embed_dim = x.shape
 
+        # concat buffer
         x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
 
+        # random drop class embedding during training
         if self.training:
             drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
             drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
             class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
 
         x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
+
+        # encoder position embedding
         x = x + self.encoder_pos_embed_learned
         x = self.z_proj_ln(x)
 
+        # dropping
         x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
 
+        # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.encoder_blocks: x = checkpoint(block, x)
+            for block in self.encoder_blocks:
+                x = checkpoint(block, x)
         else:
-            for block in self.encoder_blocks: x = block(x)
+            for block in self.encoder_blocks:
+                x = block(x)
         x = self.encoder_norm(x)
+
         return x
 
     def forward_mae_decoder(self, x, mask):
+
         x = self.decoder_embed(x)
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
 
+        # pad mask tokens
         mask_tokens = self.mask_token.repeat(mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
         x_after_pad = mask_tokens.clone()
         x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+
+        # decoder position embedding
         x = x_after_pad + self.decoder_pos_embed_learned
 
+        # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            for block in self.decoder_blocks: x = checkpoint(block, x)
+            for block in self.decoder_blocks:
+                x = checkpoint(block, x)
         else:
-            for block in self.decoder_blocks: x = block(x)
+            for block in self.decoder_blocks:
+                x = block(x)
         x = self.decoder_norm(x)
+
         x = x[:, self.buffer_size:]
         x = x + self.diffusion_pos_embed_learned
         return x
@@ -209,216 +261,137 @@ class MAR(nn.Module):
         loss = self.diffloss(z=z, target=target, mask=mask)
         return loss
 
-    # --------------------------------------------------------------------------
-    # AR Training Logic
-    # --------------------------------------------------------------------------
-    def forward_ar(self, imgs, labels, mode='raster'):
-        bsz = imgs.shape[0]
+    def forward(self, imgs, labels):
+
+        # class embed
         class_embedding = self.class_emb(labels)
+
+        # patchify and mask (drop) tokens
         x = self.patchify(imgs)
         gt_latents = x.clone().detach()
+        
+        # Generate orders based on mode
+        if self.generation_mode == 'raster_ar':
+            orders = self.get_raster_orders(bsz=x.size(0))
+        else:  # 'masked_ar' or 'random_ar'
+            orders = self.sample_orders(bsz=x.size(0))
+        
+        mask = self.random_masking(x, orders)
 
-        if mode == 'raster':
-            orders = self.sample_raster_orders(bsz)
-        elif mode == 'random':
-            orders = self.sample_orders(bsz)
-        else:
-            raise ValueError(f"Unknown AR mode: {mode}")
-        
-        # Sample t from [0, seq_len - 1]
-        # t represents the index of the token we are predicting right now.
-        # So 0 to t-1 are visible.
-        num_visible_scalar = torch.randint(0, self.seq_len, (1,), device=x.device).item()
-        
-        # 'rank' tells us the position of each token in the order
-        rank = torch.argsort(orders, dim=1)
-        
-        # Mask construction (Same for all batch items in terms of count, different indices)
-        # mask = 1 if rank >= num_visible (Hidden)
-        # mask = 0 if rank < num_visible (Visible)
-        mask = (rank >= num_visible_scalar).float()
-        
-        # Target: The token at rank == num_visible_scalar
-        mask_for_loss = (rank == num_visible_scalar).float()
+        # mae encoder
+        x = self.forward_mae_encoder(x, mask, class_embedding)
 
-        # Forward
-        x_enc = self.forward_mae_encoder(x, mask, class_embedding)
-        z_dec = self.forward_mae_decoder(x_enc, mask)
-        
-        # Loss
-        loss = self.forward_loss(z=z_dec, target=gt_latents, mask=mask_for_loss)
+        # mae decoder
+        z = self.forward_mae_decoder(x, mask)
+
+        # diffloss
+        loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
+
         return loss
 
-    def forward(self, imgs, labels, mode='mar'):
-        if mode == 'mar':
-            class_embedding = self.class_emb(labels)
-            x = self.patchify(imgs)
-            gt_latents = x.clone().detach()
-            orders = self.sample_orders(bsz=x.size(0))
-            mask = self.random_masking(x, orders)
-            
-            x = self.forward_mae_encoder(x, mask, class_embedding)
-            z = self.forward_mae_decoder(x, mask)
-            loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
-            return loss
-            
-        elif mode == 'ar_raster':
-            return self.forward_ar(imgs, labels, mode='raster')
-            
-        elif mode == 'ar_random':
-            return self.forward_ar(imgs, labels, mode='random')
-            
-        else:
-            raise ValueError(f"Unknown mode {mode}")
-
-    # --------------------------------------------------------------------------
-    # 1. Parallel MAR Sampling
-    # --------------------------------------------------------------------------
     def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
+
+        # init and sample generation orders
         mask = torch.ones(bsz, self.seq_len).cuda()
         tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
-        orders = self.sample_orders(bsz)
+        
+        # Generate orders based on mode
+        if self.generation_mode == 'raster_ar':
+            orders = self.get_raster_orders(bsz)
+        else:  # 'masked_ar' or 'random_ar'
+            orders = self.sample_orders(bsz)
 
         indices = list(range(num_iter))
-        if progress: indices = tqdm(indices)
+        if progress:
+            indices = tqdm(indices)
         
+        # generate latents
         for step in indices:
             cur_tokens = tokens.clone()
+
+            # class embedding and CFG
             if labels is not None:
                 class_embedding = self.class_emb(labels)
             else:
                 class_embedding = self.fake_latent.repeat(bsz, 1)
             if not cfg == 1.0:
-                tokens_in = torch.cat([tokens, tokens], dim=0)
-                class_embedding_in = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
-                mask_in = torch.cat([mask, mask], dim=0)
+                tokens = torch.cat([tokens, tokens], dim=0)
+                class_embedding = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
+                mask = torch.cat([mask, mask], dim=0)
+
+            # mae encoder
+            x = self.forward_mae_encoder(tokens, mask, class_embedding)
+
+            # mae decoder
+            z = self.forward_mae_decoder(x, mask)
+
+            # Determine mask ratio for next round based on generation mode
+            if self.generation_mode == 'masked_ar':
+                # Original MAR: cosine schedule for multiple tokens
+                mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+                mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
+            elif self.generation_mode in ['random_ar', 'raster_ar']:
+                # Sequential AR: predict one token at a time
+                mask_len = torch.Tensor([max(0, self.seq_len - (step + 1))]).cuda()
             else:
-                tokens_in = tokens
-                class_embedding_in = class_embedding
-                mask_in = mask
+                raise ValueError(f"Unknown generation_mode: {self.generation_mode}")
 
-            x = self.forward_mae_encoder(tokens_in, mask_in, class_embedding_in)
-            z = self.forward_mae_decoder(x, mask_in)
+            # masks out at least one for the next iteration
+            mask_len = torch.maximum(torch.Tensor([0]).cuda(),
+                                     torch.minimum(torch.sum(mask, dim=-1, keepdims=True), mask_len))
 
-            mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
-            mask_len = torch.maximum(torch.Tensor([1]).cuda(),
-                                     torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
-
-            # Handle CFG batch size mismatch
-            if cfg != 1.0:
-                orders_inf = torch.cat([orders, orders], dim=0)
+            # get masking for next iteration and locations to be predicted in this iteration
+            if mask_len[0] > 0:
+                mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
             else:
-                orders_inf = orders
-
-            mask_next = mask_by_order(mask_len[0], orders_inf, mask_in.shape[0], self.seq_len)
+                mask_next = torch.zeros(bsz, self.seq_len).cuda().bool()
             
             if step >= num_iter - 1:
-                mask_to_pred = mask_in.bool()
+                mask_to_pred = mask[:bsz].bool()
             else:
-                mask_to_pred = torch.logical_xor(mask_in.bool(), mask_next.bool())
-            
+                mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
             mask = mask_next
-            
+            if not cfg == 1.0:
+                mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+
+            # sample token latents for this step
             z = z[mask_to_pred.nonzero(as_tuple=True)]
-            
+            # cfg schedule follow Muse
             if cfg_schedule == "linear":
                 cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
-            else:
+            elif cfg_schedule == "constant":
                 cfg_iter = cfg
-                
+            else:
+                raise NotImplementedError
             sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
-            
             if not cfg == 1.0:
-                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)
+                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
                 mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
-                mask = mask.chunk(2, dim=0)[0]
 
             cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
             tokens = cur_tokens.clone()
 
+        # unpatchify
         tokens = self.unpatchify(tokens)
         return tokens
-        
-    # --------------------------------------------------------------------------
-    # 2. Token-by-Token AR Sampling
-    # --------------------------------------------------------------------------
-    def sample_tokens_ar(self, bsz, mode='raster', cfg=1.0, labels=None, temperature=1.0, progress=False):
-        mask = torch.ones(bsz, self.seq_len).cuda() # Start all masked
-        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
 
-        if mode == 'ar_raster' or mode == 'raster':
-            orders = self.sample_raster_orders(bsz)
-        elif mode == 'ar_random' or mode == 'random':
-            orders = self.sample_orders(bsz)
-        else:
-            raise ValueError(f"Unknown AR sampling mode: {mode}")
-
-        indices = list(range(self.seq_len)) 
-        if progress: indices = tqdm(indices)
-            
-        for step in indices:
-            cur_tokens = tokens.clone()
-            
-            if labels is not None:
-                class_embedding = self.class_emb(labels)
-            else:
-                class_embedding = self.fake_latent.repeat(bsz, 1)
-                
-            if not cfg == 1.0:
-                tokens_in = torch.cat([tokens, tokens], dim=0)
-                class_embedding_in = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
-                mask_in = torch.cat([mask, mask], dim=0)
-            else:
-                tokens_in = tokens
-                class_embedding_in = class_embedding
-                mask_in = mask
-
-            x = self.forward_mae_encoder(tokens_in, mask_in, class_embedding_in)
-            z = self.forward_mae_decoder(x, mask_in)
-
-            # Identify target indices (step-th element in order)
-            # orders: [B, L].
-            if cfg != 1.0:
-                # Repeat orders for CFG batch
-                orders_inf = torch.cat([orders, orders], dim=0)
-            else:
-                orders_inf = orders
-                
-            target_indices = orders_inf[:, step] # [B_cfg]
-            
-            mask_to_pred = torch.zeros_like(mask_in)
-            mask_to_pred.scatter_(1, target_indices.unsqueeze(1), 1.0)
-            mask_to_pred = mask_to_pred.bool()
-
-            z_target = z[mask_to_pred.nonzero(as_tuple=True)]
-            
-            sampled_token_latent = self.diffloss.sample(z_target, temperature, cfg)
-            
-            if not cfg == 1.0:
-                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)
-                mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
-                # Update mask only for the real batch (not CFG duplicate)
-                target_indices = target_indices[:bsz]
-
-            cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
-            tokens = cur_tokens.clone()
-            
-            # Unmask
-            mask.scatter_(1, target_indices.unsqueeze(1), 0.0)
-
-        return self.unpatchify(tokens)
 
 def mar_base(**kwargs):
-    return MAR(encoder_embed_dim=768, encoder_depth=12, encoder_num_heads=12,
-               decoder_embed_dim=768, decoder_depth=12, decoder_num_heads=12,
-               mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    model = MAR(
+        encoder_embed_dim=768, encoder_depth=12, encoder_num_heads=12,
+        decoder_embed_dim=768, decoder_depth=12, decoder_num_heads=12,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
 
 def mar_large(**kwargs):
-    return MAR(encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
-               decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
-               mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    
+    model = MAR(
+        encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
+        decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
 def mar_huge(**kwargs):
     model = MAR(
         encoder_embed_dim=1280, encoder_depth=20, encoder_num_heads=16,
